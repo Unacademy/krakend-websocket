@@ -40,31 +40,52 @@ func setupWebSocketMiddleware(existingHandlerFactory router.HandlerFactory, logg
 
 ### 2. Configure WebSocket Endpoints
 
-Add WebSocket configuration to your KrakenD endpoint configuration:
+Add WebSocket configuration to your KrakenD endpoint configuration. The configuration follows the standard KrakenD v2 format:
 
 ```json
 {
+  "version": 2,
+  "name": "KrakenD Gateway with WebSocket Support",
+  "port": 8080,
   "endpoints": [
     {
-      "endpoint": "/api/v1/albus/chat/",
-      "methods": ["GET"],
+      "endpoint": "/audio/converse/",
+      "method": "GET",
       "extra_config": {
         "websocket": {
           "read_buffer_size": 1024,
           "write_buffer_size": 1024,
-          "handshake_timeout": "30s",
-          "compression": true,
-          "subprotocols": ["chat.v1", "chat"],
-          "backend_scheme": "wss"
+          "handshake_timeout": "10s",
+          "compression": false
         }
       },
-      "auth": true,
-      "backend": "albus",
-      "backend_path": "/api/v1/chat/",
-      "auth_config": {
-        "add_groups": true,
-        "should_abort": true
-      }
+      "backend": [
+        {
+          "url_pattern": "/audio/converse/",
+          "method": "GET",
+          "host": ["http://localhost:8000"]
+        }
+      ]
+    },
+    {
+      "endpoint": "/api/v1/chat/",
+      "method": "GET",
+      "extra_config": {
+        "websocket": {
+          "read_buffer_size": 2048,
+          "write_buffer_size": 2048,
+          "handshake_timeout": "30s",
+          "compression": true,
+          "subprotocols": ["chat.v1", "chat"]
+        }
+      },
+      "backend": [
+        {
+          "url_pattern": "/api/v1/chat/",
+          "method": "GET",
+          "host": ["http://localhost:3000"]
+        }
+      ]
     }
   ]
 }
@@ -81,7 +102,10 @@ Add WebSocket configuration to your KrakenD endpoint configuration:
 | `subprotocols` | []string | [] | Supported WebSocket subprotocols |
 | `backend_scheme` | string | "" | Force WebSocket scheme ("ws" or "wss"). Auto-detected if not specified |
 
-**Note**: You must also configure your backend names to WebSocket URLs in the middleware. Currently hardcoded but should be made configurable.
+**Important Notes**: 
+- Use `method: "GET"` for WebSocket endpoints (required for WebSocket upgrade)
+- Backend `host` should use HTTP scheme (`http://` or `https://`) - the middleware automatically converts to WebSocket URLs
+- WebSocket endpoints work alongside regular HTTP endpoints in the same configuration
 
 ## How It Works
 
@@ -107,86 +131,16 @@ Client WebSocket ↔ KrakenD (Auth + Proxy) ↔ Backend WebSocket
 
 **Authentication Header Forwarding:**
 During the initial WebSocket handshake, the middleware extracts and forwards authentication headers to the backend connection:
-- `Authorization`
-- `X-User-Id`, `X-User-Uid`, `X-User-Name`, `X-User-Email`  
-- `X-Auth-Token`, `X-Auth-User`
-- `X-Group-Id`, `X-Group-Name`
+- `X-User-Id`, `X-User-Uid`, `X-User-Email`
+- `X-User-Groups`, `X-User-Type`
 - Any headers with `X-User-`, `X-Auth-`, or `X-Group-` prefixes
 
 **Message Proxying:**
 All WebSocket messages (text, binary, ping, pong) are forwarded bidirectionally without modification.
 
-## Example: Chat Application
+## Backend Integration
 
-### Backend WebSocket Server
-```go
-// Backend runs a native WebSocket server
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-    // Auth headers are available in the upgrade request
-    userID := r.Header.Get("X-User-Id")
-    authToken := r.Header.Get("X-Auth-Token")
-    
-    // Upgrade to WebSocket
-    upgrader := websocket.Upgrader{
-        CheckOrigin: func(r *http.Request) bool { return true },
-    }
-    
-    conn, err := upgrader.Upgrade(w, r, nil)
-    if err != nil {
-        log.Printf("WebSocket upgrade failed: %v", err)
-        return
-    }
-    defer conn.Close()
-    
-    log.Printf("WebSocket connection established for user: %s", userID)
-    
-    // Handle WebSocket messages directly
-    for {
-        messageType, message, err := conn.ReadMessage()
-        if err != nil {
-            log.Printf("Read error: %v", err)
-            break
-        }
-        
-        // Process message and send response
-        response := fmt.Sprintf("Echo from %s: %s", userID, string(message))
-        err = conn.WriteMessage(messageType, []byte(response))
-        if err != nil {
-            log.Printf("Write error: %v", err)
-            break
-        }
-    }
-}
-
-// Register handler
-http.HandleFunc("/api/v1/chat/", handleWebSocket)
-```
-
-### WebSocket Client
-```javascript
-// Connect with subprotocol and auth headers in the initial request
-const ws = new WebSocket('ws://localhost:8080/api/v1/websocket/chat/', ['chat.v1']);
-
-ws.onopen = () => {
-    console.log('WebSocket connected');
-    ws.send(JSON.stringify({
-        type: 'chat',
-        content: 'Hello WebSocket!',
-        timestamp: Date.now()
-    }));
-};
-
-ws.onmessage = (event) => {
-    const response = JSON.parse(event.data);
-    console.log('Received:', response);
-};
-
-ws.onerror = (error) => {
-    console.error('WebSocket error:', error);
-};
-```
-
-**Note**: Authentication headers must be included in the initial HTTP upgrade request. The KrakenD auth middleware will inject these headers which are then forwarded to your backend WebSocket service.
+Your backend WebSocket server will receive the forwarded authentication headers from KrakenD during the WebSocket upgrade request. The headers (`X-User-Id`, `X-User-Uid`, `X-User-Email`, etc.) are available in the standard HTTP request headers and can be used for authentication and authorization in your WebSocket handlers.
 
 ## Authentication & Authorization
 
