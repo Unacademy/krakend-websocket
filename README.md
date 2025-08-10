@@ -56,7 +56,8 @@ Add WebSocket configuration to your KrakenD endpoint configuration. The configur
           "read_buffer_size": 1024,
           "write_buffer_size": 1024,
           "handshake_timeout": "10s",
-          "compression": false
+          "compression": false,
+          "max_message_size": 10485760
         }
       },
       "backend": [
@@ -76,7 +77,8 @@ Add WebSocket configuration to your KrakenD endpoint configuration. The configur
           "write_buffer_size": 2048,
           "handshake_timeout": "30s",
           "compression": true,
-          "subprotocols": ["chat.v1", "chat"]
+          "subprotocols": ["chat.v1", "chat"],
+          "max_message_size": 1048576
         }
       },
       "backend": [
@@ -101,6 +103,7 @@ Add WebSocket configuration to your KrakenD endpoint configuration. The configur
 | `compression` | bool | false | Enable WebSocket compression |
 | `subprotocols` | []string | [] | Supported WebSocket subprotocols |
 | `backend_scheme` | string | "" | Force WebSocket scheme ("ws" or "wss"). Auto-detected if not specified |
+| `max_message_size` | int64 | 1048576 | Maximum message size in bytes (1MB default, 0 = no limit) |
 
 **Important Notes**: 
 - Use `method: "GET"` for WebSocket endpoints (required for WebSocket upgrade)
@@ -172,6 +175,29 @@ The middleware provides comprehensive error handling:
 - **Authentication Failures**: Unauthorized requests are rejected before WebSocket upgrade
 - **Backend Errors**: Backend failures are sent as error messages over WebSocket
 - **Connection Errors**: Connection issues are logged and connections are gracefully closed
+- **Message Size Limits**: Messages exceeding `max_message_size` trigger connection closure with appropriate error codes
+
+### Common Issues
+
+#### "read limited at X bytes" Error
+This error occurs when WebSocket messages exceed the configured message size limit. To resolve:
+
+1. **Increase `max_message_size`** in your WebSocket endpoint configuration:
+   ```json
+   {
+     "websocket": {
+       "max_message_size": 10485760
+     }
+   }
+   ```
+
+2. **Choose appropriate limits** based on your use case:
+   - **Text messaging**: 1MB (default) is usually sufficient
+   - **Audio streaming**: 10MB+ recommended  
+   - **File transfers**: Set based on expected file sizes
+   - **No limit**: Set to `0` (use with caution)
+
+3. **Monitor backend message sizes** to ensure they align with your configuration
 
 ## Development & Testing
 
