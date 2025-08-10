@@ -26,6 +26,7 @@ type Config struct {
 	Compression      bool          `json:"compression"`
 	Subprotocols     []string      `json:"subprotocols"`
 	BackendScheme    string        `json:"backend_scheme"` // "ws" or "wss" to override scheme detection
+	MaxMessageSize   int64         `json:"max_message_size"` // Maximum message size in bytes (0 = no limit)
 }
 
 // BackendRegistry holds the mapping of backend names to WebSocket URLs
@@ -158,6 +159,7 @@ func parseWebSocketConfig(extraConfig config.ExtraConfig) (Config, bool) {
 		HandshakeTimeout: 10 * time.Second,
 		Compression:      false,
 		Subprotocols:     []string{},
+		MaxMessageSize:   1 << 20, // Default 1MB limit
 	}
 
 	if readBufferSize, ok := wsConfigMap["read_buffer_size"].(float64); ok {
@@ -188,6 +190,10 @@ func parseWebSocketConfig(extraConfig config.ExtraConfig) (Config, bool) {
 
 	if backendScheme, ok := wsConfigMap["backend_scheme"].(string); ok {
 		cfg.BackendScheme = backendScheme
+	}
+
+	if maxMessageSize, ok := wsConfigMap["max_message_size"].(float64); ok {
+		cfg.MaxMessageSize = int64(maxMessageSize)
 	}
 
 	return cfg, true
@@ -221,6 +227,12 @@ func (w *HandlerFactory) handleWebSocketConnection(c *gin.Context, cfg *config.E
 		return
 	}
 	defer conn.Close(websocket.StatusInternalError, "Internal error")
+
+	// Set read limit for client connection
+	if wsConfig.MaxMessageSize > 0 {
+		conn.SetReadLimit(wsConfig.MaxMessageSize)
+		w.logger.Debug(fmt.Sprintf("Set client read limit to %d bytes", wsConfig.MaxMessageSize))
+	}
 
 	w.logger.Debug("WebSocket connection established for:", cfg.Endpoint)
 
@@ -331,6 +343,12 @@ func (w *HandlerFactory) connectToBackend(ctx context.Context, cfg *config.Endpo
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to backend WebSocket %s: %w", wsURL, err)
+	}
+
+	// Set read limit for backend connection
+	if wsConfig.MaxMessageSize > 0 {
+		conn.SetReadLimit(wsConfig.MaxMessageSize)
+		w.logger.Debug(fmt.Sprintf("Set backend read limit to %d bytes", wsConfig.MaxMessageSize))
 	}
 
 	return conn, nil
