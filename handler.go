@@ -39,8 +39,8 @@ var globalBackendRegistry *BackendRegistry
 
 // HandlerFactory creates handlers for WebSocket endpoints
 type HandlerFactory struct {
-	logger             logging.Logger
-	serviceConfig      config.ServiceConfig
+	logger                logging.Logger
+	serviceConfig         config.ServiceConfig
 	fullMiddlewareFactory router.HandlerFactory // The complete middleware chain including auth
 }
 
@@ -93,7 +93,7 @@ func InitializeBackendRegistry(serviceConfig config.ServiceConfig) {
 func (w *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFactory) router.HandlerFactory {
 	// Store the full middleware factory for auth processing
 	w.fullMiddlewareFactory = standardHandlerFactory
-	
+
 	return func(cfg *config.EndpointConfig, p proxy.Proxy) gin.HandlerFunc {
 		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Building the WebSocket handler", cfg.Endpoint))
 
@@ -151,49 +151,54 @@ func isWebSocketUpgrade(r *http.Request) bool {
 func (w *HandlerFactory) runAuthenticationIfNeeded(c *gin.Context, cfg *config.EndpointConfig, p proxy.Proxy) map[string]string {
 	// First, check if auth headers are already present in the request
 	authHeaders := w.extractAuthHeaders(c.Request.Header)
-	
+
 	// If we already have auth headers, assume authentication was handled upstream
 	if len(authHeaders) > 0 {
 		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Found existing auth headers, skipping auth middleware", cfg.Endpoint))
 		return authHeaders
 	}
-	
+
 	// Check if this endpoint appears to require authentication by looking for Bearer token
 	authHeader := c.Request.Header.Get("Authorization")
 	if authHeader == "" {
 		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] No Authorization header found, proceeding without auth", cfg.Endpoint))
 		return make(map[string]string) // Return empty map, not nil
 	}
-	
+
 	// Run the full middleware chain to handle authentication
 	w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Running auth middleware for WebSocket upgrade", cfg.Endpoint))
-	
-	// Create a response recorder to capture auth middleware response
+
+	// Create a lightweight response recorder that doesn't perform any I/O operations
 	recorder := &authResponseRecorder{
 		ResponseWriter: c.Writer,
 		statusCode:     http.StatusOK,
 	}
 	originalWriter := c.Writer
 	c.Writer = recorder
-	
-	// Run the full handler (which includes auth middleware)
-	fullHandler := w.fullMiddlewareFactory(cfg, p)
-	fullHandler(c)
-	
-	// Restore the original response writer
+
+	// Store original request path to avoid any proxy processing
+	originalPath := c.Request.URL.Path
+
+	// Run just the auth part of the middleware chain, not the full handler
+	// This avoids the expensive proxy operations
+	authHandler := w.fullMiddlewareFactory(cfg, dummyProxy)
+	authHandler(c)
+
+	// Restore the original response writer and path
 	c.Writer = originalWriter
-	
+	c.Request.URL.Path = originalPath
+
 	// Check if auth middleware failed
 	if recorder.statusCode == http.StatusUnauthorized || recorder.statusCode == http.StatusForbidden {
 		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Authentication failed with status %d", cfg.Endpoint, recorder.statusCode))
 		c.JSON(recorder.statusCode, gin.H{"error": "Authentication failed"})
 		return nil
 	}
-	
+
 	// Auth succeeded, extract the headers that were added by auth middleware
 	authHeaders = w.extractAuthHeaders(c.Request.Header)
 	w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Authentication succeeded, extracted headers: %v", cfg.Endpoint, authHeaders))
-	
+
 	return authHeaders
 }
 
@@ -213,6 +218,20 @@ func (r *authResponseRecorder) Write(data []byte) (int, error) {
 	// Don't write response body for WebSocket upgrades
 	// The WebSocket handler will handle the upgrade response
 	return len(data), nil
+}
+
+// dummyProxy is a no-op proxy that prevents any actual backend calls during auth validation
+func dummyProxy(ctx context.Context, request *proxy.Request) (*proxy.Response, error) {
+	// Return empty response to avoid any backend processing
+	// The auth middleware will have already processed and added headers to the request
+	return &proxy.Response{
+		Data:       map[string]interface{}{},
+		IsComplete: true,
+		Metadata: proxy.Metadata{
+			Headers:    map[string][]string{},
+			StatusCode: 200,
+		},
+	}, nil
 }
 
 // parseWebSocketConfig extracts WebSocket configuration from endpoint extra config
@@ -404,12 +423,15 @@ func (w *HandlerFactory) connectToBackend(ctx context.Context, cfg *config.Endpo
 
 	w.logger.Debug(fmt.Sprintf("Connecting to backend WebSocket: %s", wsURL))
 
-	// Create request headers with auth headers
+	// Create request headers with auth headers ONLY (strip Authorization header)
 	headers := make(map[string][]string)
 	for key, value := range authHeaders {
 		headers[key] = []string{value}
 		w.logger.Debug(fmt.Sprintf("Adding auth header to backend connection: %s = %s", key, value))
 	}
+
+	// Explicitly ensure Authorization header is NOT forwarded to backend
+	// The auth headers (X-User-Id, etc.) should be used instead
 
 	// Dial the backend WebSocket
 	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
