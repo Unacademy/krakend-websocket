@@ -25,7 +25,7 @@ type Config struct {
 	HandshakeTimeout time.Duration `json:"handshake_timeout"`
 	Compression      bool          `json:"compression"`
 	Subprotocols     []string      `json:"subprotocols"`
-	BackendScheme    string        `json:"backend_scheme"` // "ws" or "wss" to override scheme detection
+	BackendScheme    string        `json:"backend_scheme"`   // "ws" or "wss" to override scheme detection
 	MaxMessageSize   int64         `json:"max_message_size"` // Maximum message size in bytes (0 = no limit)
 }
 
@@ -39,7 +39,9 @@ var globalBackendRegistry *BackendRegistry
 
 // HandlerFactory creates handlers for WebSocket endpoints
 type HandlerFactory struct {
-	logger logging.Logger
+	logger             logging.Logger
+	serviceConfig      config.ServiceConfig
+	fullMiddlewareFactory router.HandlerFactory // The complete middleware chain including auth
 }
 
 // Define custom context key type for Gin compatibility
@@ -51,6 +53,14 @@ const ginContextKey contextKey = "gin-context"
 func NewHandlerFactory(logger logging.Logger) *HandlerFactory {
 	return &HandlerFactory{
 		logger: logger,
+	}
+}
+
+// NewHandlerFactoryWithConfig returns a new WebSocket HandlerFactory with service configuration
+func NewHandlerFactoryWithConfig(logger logging.Logger, serviceConfig config.ServiceConfig) *HandlerFactory {
+	return &HandlerFactory{
+		logger:        logger,
+		serviceConfig: serviceConfig,
 	}
 }
 
@@ -81,6 +91,9 @@ func InitializeBackendRegistry(serviceConfig config.ServiceConfig) {
 
 // HandlerWrapper wraps the standard handler factory to support WebSocket endpoints
 func (w *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFactory) router.HandlerFactory {
+	// Store the full middleware factory for auth processing
+	w.fullMiddlewareFactory = standardHandlerFactory
+	
 	return func(cfg *config.EndpointConfig, p proxy.Proxy) gin.HandlerFunc {
 		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Building the WebSocket handler", cfg.Endpoint))
 
@@ -102,25 +115,18 @@ func (w *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 					return
 				}
 
-				// WebSocket upgrades must be GET requests, but KrakenD config might specify POST
-				// This is normal - the client sends GET for upgrade, backend receives WebSocket connection
-
 				w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] WebSocket upgrade request detected", cfg.Endpoint))
 
-				// For WebSocket upgrades, we need to capture auth headers without running
-				// the full middleware chain that interferes with WebSocket upgrade
-
-				// Capture any existing auth headers from the original request
-				authHeaders := w.extractAuthHeaders(c.Request.Header)
-				w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Extracted auth headers for WebSocket: %v", cfg.Endpoint, authHeaders))
-
-				// If no auth headers found in request, we could potentially run a lightweight
-				// auth validation here, but for now we'll proceed with what we have
-				if len(authHeaders) == 0 {
-					w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] No auth headers found in WebSocket request", cfg.Endpoint))
+				// Check if this endpoint requires authentication
+				authHeaders := w.runAuthenticationIfNeeded(c, cfg, p)
+				if authHeaders == nil {
+					// Authentication failed, response already sent
+					return
 				}
 
-				// Now handle the WebSocket upgrade and connection with auth headers
+				w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Auth headers for WebSocket: %v", cfg.Endpoint, authHeaders))
+
+				// Handle the WebSocket upgrade and connection with auth headers
 				w.handleWebSocketConnection(c, cfg, p, wsConfig, authHeaders)
 			}
 		}
@@ -139,6 +145,74 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return upgrade == "websocket" &&
 		strings.Contains(connection, "upgrade") &&
 		key != ""
+}
+
+// runAuthenticationIfNeeded runs authentication middleware for WebSocket upgrades if required
+func (w *HandlerFactory) runAuthenticationIfNeeded(c *gin.Context, cfg *config.EndpointConfig, p proxy.Proxy) map[string]string {
+	// First, check if auth headers are already present in the request
+	authHeaders := w.extractAuthHeaders(c.Request.Header)
+	
+	// If we already have auth headers, assume authentication was handled upstream
+	if len(authHeaders) > 0 {
+		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Found existing auth headers, skipping auth middleware", cfg.Endpoint))
+		return authHeaders
+	}
+	
+	// Check if this endpoint appears to require authentication by looking for Bearer token
+	authHeader := c.Request.Header.Get("Authorization")
+	if authHeader == "" {
+		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] No Authorization header found, proceeding without auth", cfg.Endpoint))
+		return make(map[string]string) // Return empty map, not nil
+	}
+	
+	// Run the full middleware chain to handle authentication
+	w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Running auth middleware for WebSocket upgrade", cfg.Endpoint))
+	
+	// Create a response recorder to capture auth middleware response
+	recorder := &authResponseRecorder{
+		ResponseWriter: c.Writer,
+		statusCode:     http.StatusOK,
+	}
+	originalWriter := c.Writer
+	c.Writer = recorder
+	
+	// Run the full handler (which includes auth middleware)
+	fullHandler := w.fullMiddlewareFactory(cfg, p)
+	fullHandler(c)
+	
+	// Restore the original response writer
+	c.Writer = originalWriter
+	
+	// Check if auth middleware failed
+	if recorder.statusCode == http.StatusUnauthorized || recorder.statusCode == http.StatusForbidden {
+		w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Authentication failed with status %d", cfg.Endpoint, recorder.statusCode))
+		c.JSON(recorder.statusCode, gin.H{"error": "Authentication failed"})
+		return nil
+	}
+	
+	// Auth succeeded, extract the headers that were added by auth middleware
+	authHeaders = w.extractAuthHeaders(c.Request.Header)
+	w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Authentication succeeded, extracted headers: %v", cfg.Endpoint, authHeaders))
+	
+	return authHeaders
+}
+
+// authResponseRecorder captures auth middleware responses while preserving WebSocket upgrade capability
+type authResponseRecorder struct {
+	gin.ResponseWriter
+	statusCode int
+}
+
+func (r *authResponseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
+	// Don't write the status code to the underlying writer for WebSocket upgrades
+	// We'll check the status code to determine if auth succeeded
+}
+
+func (r *authResponseRecorder) Write(data []byte) (int, error) {
+	// Don't write response body for WebSocket upgrades
+	// The WebSocket handler will handle the upgrade response
+	return len(data), nil
 }
 
 // parseWebSocketConfig extracts WebSocket configuration from endpoint extra config
@@ -506,6 +580,6 @@ func NewWithConfig(handlerFactory router.HandlerFactory, logger logging.Logger, 
 	// Initialize backend registry from service configuration
 	InitializeBackendRegistry(serviceConfig)
 
-	wsFactory := NewHandlerFactory(logger)
+	wsFactory := NewHandlerFactoryWithConfig(logger, serviceConfig)
 	return wsFactory.HandlerWrapper(handlerFactory)
 }
