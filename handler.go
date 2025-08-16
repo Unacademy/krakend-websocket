@@ -527,27 +527,57 @@ func (w *HandlerFactory) getAvailableBackends() []string {
 	return backends
 }
 
-// proxyMessages forwards messages between two WebSocket connections
+// proxyMessages forwards messages between two WebSocket connections with true full-duplex operation
 func (w *HandlerFactory) proxyMessages(ctx context.Context, src, dest *websocket.Conn, direction string) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			messageType, message, err := src.Read(ctx)
-			if err != nil {
-				w.logger.Debug(fmt.Sprintf("WebSocket read error (%s): %v", direction, err))
-				return err
-			}
+	// Create a message channel for decoupling reads from writes
+	msgChan := make(chan struct {
+		messageType websocket.MessageType
+		data        []byte
+		err         error
+	}, 100) // Buffer to prevent blocking
 
-			w.logger.Debug(fmt.Sprintf("Proxying message (%s): %d bytes", direction, len(message)))
-
-			if err := dest.Write(ctx, messageType, message); err != nil {
-				w.logger.Debug(fmt.Sprintf("WebSocket write error (%s): %v", direction, err))
-				return err
+	// Reader goroutine - continuously reads from source
+	go func() {
+		defer close(msgChan)
+		for {
+			select {
+			case <-ctx.Done():
+				msgChan <- struct {
+					messageType websocket.MessageType
+					data        []byte
+					err         error
+				}{err: ctx.Err()}
+				return
+			default:
+				messageType, message, err := src.Read(ctx)
+				msgChan <- struct {
+					messageType websocket.MessageType
+					data        []byte
+					err         error
+				}{messageType: messageType, data: message, err: err}
+				if err != nil {
+					return
+				}
 			}
 		}
+	}()
+
+	// Writer loop - continuously writes to destination
+	for msg := range msgChan {
+		if msg.err != nil {
+			w.logger.Debug(fmt.Sprintf("WebSocket read error (%s): %v", direction, msg.err))
+			return msg.err
+		}
+
+		w.logger.Debug(fmt.Sprintf("Proxying message (%s): %d bytes", direction, len(msg.data)))
+
+		if err := dest.Write(ctx, msg.messageType, msg.data); err != nil {
+			w.logger.Debug(fmt.Sprintf("WebSocket write error (%s): %v", direction, err))
+			return err
+		}
 	}
+
+	return nil
 }
 
 // extractAuthHeaders extracts auth headers from the incoming request
