@@ -20,13 +20,16 @@ const ConfigNamespace = "websocket"
 
 // Config holds the configuration for WebSocket endpoints
 type Config struct {
-	ReadBufferSize   int           `json:"read_buffer_size"`
-	WriteBufferSize  int           `json:"write_buffer_size"`
-	HandshakeTimeout time.Duration `json:"handshake_timeout"`
-	Compression      bool          `json:"compression"`
-	Subprotocols     []string      `json:"subprotocols"`
-	BackendScheme    string        `json:"backend_scheme"`   // "ws" or "wss" to override scheme detection
-	MaxMessageSize   int64         `json:"max_message_size"` // Maximum message size in bytes (0 = no limit)
+	ReadBufferSize     int           `json:"read_buffer_size"`
+	WriteBufferSize    int           `json:"write_buffer_size"`
+	HandshakeTimeout   time.Duration `json:"handshake_timeout"`
+	Compression        bool          `json:"compression"`
+	Subprotocols       []string      `json:"subprotocols"`
+	BackendScheme      string        `json:"backend_scheme"`      // "ws" or "wss" to override scheme detection
+	MaxMessageSize     int64         `json:"max_message_size"`    // Maximum message size in bytes (0 = no limit)
+	PassthroughHeaders []string      `json:"passthrough_headers"` // Additional headers to forward to backend
+	PassAllHeaders     bool          `json:"pass_all_headers"`    // Pass all headers except excluded ones
+	ExcludeHeaders     []string      `json:"exclude_headers"`     // Headers to exclude when pass_all_headers is true
 }
 
 // BackendRegistry holds the mapping of backend names to WebSocket URLs
@@ -126,8 +129,12 @@ func (w *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 
 				w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Auth headers for WebSocket: %v", cfg.Endpoint, authHeaders))
 
-				// Handle the WebSocket upgrade and connection with auth headers
-				w.handleWebSocketConnection(c, cfg, p, wsConfig, authHeaders)
+				// Extract all headers to forward based on configuration
+				forwardHeaders := w.extractHeadersToForward(c.Request.Header, wsConfig, authHeaders)
+				w.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Headers to forward: %v", cfg.Endpoint, forwardHeaders))
+
+				// Handle the WebSocket upgrade and connection with all forward headers
+				w.handleWebSocketConnection(c, cfg, p, wsConfig, forwardHeaders)
 			}
 		}
 
@@ -247,12 +254,15 @@ func parseWebSocketConfig(extraConfig config.ExtraConfig) (Config, bool) {
 	}
 
 	cfg := Config{
-		ReadBufferSize:   1024, // Default values
-		WriteBufferSize:  1024,
-		HandshakeTimeout: 10 * time.Second,
-		Compression:      false,
-		Subprotocols:     []string{},
-		MaxMessageSize:   1 << 20, // Default 1MB limit
+		ReadBufferSize:     1024, // Default values
+		WriteBufferSize:    1024,
+		HandshakeTimeout:   10 * time.Second,
+		Compression:        false,
+		Subprotocols:       []string{},
+		MaxMessageSize:     1 << 20, // Default 1MB limit
+		PassthroughHeaders: []string{},
+		PassAllHeaders:     false,
+		ExcludeHeaders:     []string{"Authorization", "Cookie"}, // Default exclusions for security
 	}
 
 	if readBufferSize, ok := wsConfigMap["read_buffer_size"].(float64); ok {
@@ -289,11 +299,32 @@ func parseWebSocketConfig(extraConfig config.ExtraConfig) (Config, bool) {
 		cfg.MaxMessageSize = int64(maxMessageSize)
 	}
 
+	if passthroughHeaders, ok := wsConfigMap["passthrough_headers"].([]interface{}); ok {
+		for _, header := range passthroughHeaders {
+			if headerStr, ok := header.(string); ok {
+				cfg.PassthroughHeaders = append(cfg.PassthroughHeaders, headerStr)
+			}
+		}
+	}
+
+	if passAllHeaders, ok := wsConfigMap["pass_all_headers"].(bool); ok {
+		cfg.PassAllHeaders = passAllHeaders
+	}
+
+	if excludeHeaders, ok := wsConfigMap["exclude_headers"].([]interface{}); ok {
+		cfg.ExcludeHeaders = []string{} // Clear defaults if explicitly configured
+		for _, header := range excludeHeaders {
+			if headerStr, ok := header.(string); ok {
+				cfg.ExcludeHeaders = append(cfg.ExcludeHeaders, headerStr)
+			}
+		}
+	}
+
 	return cfg, true
 }
 
 // handleWebSocketConnection manages the WebSocket upgrade and connection lifecycle
-func (w *HandlerFactory) handleWebSocketConnection(c *gin.Context, cfg *config.EndpointConfig, p proxy.Proxy, wsConfig Config, authHeaders map[string]string) {
+func (w *HandlerFactory) handleWebSocketConnection(c *gin.Context, cfg *config.EndpointConfig, p proxy.Proxy, wsConfig Config, forwardHeaders map[string]string) {
 
 	// Validate backend configuration
 	if len(cfg.Backend) == 0 {
@@ -329,18 +360,18 @@ func (w *HandlerFactory) handleWebSocketConnection(c *gin.Context, cfg *config.E
 
 	w.logger.Debug("WebSocket connection established for:", cfg.Endpoint)
 
-	// Handle the WebSocket connection lifecycle with auth headers
-	w.handleConnectionLifecycle(c.Request.Context(), conn, cfg, p, wsConfig, authHeaders)
+	// Handle the WebSocket connection lifecycle with forward headers
+	w.handleConnectionLifecycle(c.Request.Context(), conn, cfg, p, wsConfig, forwardHeaders)
 }
 
 // handleConnectionLifecycle manages the WebSocket connection lifecycle and establishes backend proxy
-func (w *HandlerFactory) handleConnectionLifecycle(ctx context.Context, clientConn *websocket.Conn, cfg *config.EndpointConfig, p proxy.Proxy, wsConfig Config, authHeaders map[string]string) {
+func (w *HandlerFactory) handleConnectionLifecycle(ctx context.Context, clientConn *websocket.Conn, cfg *config.EndpointConfig, p proxy.Proxy, wsConfig Config, forwardHeaders map[string]string) {
 	// Create a context for this connection
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Establish WebSocket connection to backend
-	backendConn, err := w.connectToBackend(connCtx, cfg, wsConfig, authHeaders)
+	backendConn, err := w.connectToBackend(connCtx, cfg, wsConfig, forwardHeaders)
 	if err != nil {
 		w.logger.Error("Failed to connect to backend WebSocket:", err)
 		clientConn.Close(websocket.StatusInternalError, "Backend connection failed")
@@ -375,7 +406,7 @@ func (w *HandlerFactory) handleConnectionLifecycle(ctx context.Context, clientCo
 }
 
 // connectToBackend establishes a WebSocket connection to the backend service
-func (w *HandlerFactory) connectToBackend(ctx context.Context, cfg *config.EndpointConfig, wsConfig Config, authHeaders map[string]string) (*websocket.Conn, error) {
+func (w *HandlerFactory) connectToBackend(ctx context.Context, cfg *config.EndpointConfig, wsConfig Config, forwardHeaders map[string]string) (*websocket.Conn, error) {
 	// Support both old and new configuration formats
 	var wsURL string
 	var err error
@@ -423,15 +454,15 @@ func (w *HandlerFactory) connectToBackend(ctx context.Context, cfg *config.Endpo
 
 	w.logger.Debug(fmt.Sprintf("Connecting to backend WebSocket: %s", wsURL))
 
-	// Create request headers with auth headers ONLY (strip Authorization header)
+	// Create request headers with forward headers (may include auth and other headers)
 	headers := make(map[string][]string)
-	for key, value := range authHeaders {
+	for key, value := range forwardHeaders {
 		headers[key] = []string{value}
-		w.logger.Debug(fmt.Sprintf("Adding auth header to backend connection: %s = %s", key, value))
+		w.logger.Debug(fmt.Sprintf("Adding header to backend connection: %s = %s", key, value))
 	}
 
-	// Explicitly ensure Authorization header is NOT forwarded to backend
-	// The auth headers (X-User-Id, etc.) should be used instead
+	// Headers are filtered based on websocket configuration (pass_all_headers, passthrough_headers, exclude_headers)
+	// By default, Authorization and Cookie headers are excluded for security
 
 	// Dial the backend WebSocket
 	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
@@ -548,6 +579,51 @@ func (w *HandlerFactory) proxyMessages(ctx context.Context, src, dest *websocket
 			}
 		}
 	}
+}
+
+// extractHeadersToForward extracts headers to forward based on websocket configuration
+func (w *HandlerFactory) extractHeadersToForward(headers map[string][]string, wsConfig Config, authHeaders map[string]string) map[string]string {
+	forwardHeaders := make(map[string]string)
+
+	// Always include auth headers first
+	for key, value := range authHeaders {
+		forwardHeaders[key] = value
+	}
+
+	// Check if we should pass all headers
+	if wsConfig.PassAllHeaders {
+		// Pass all headers except excluded ones
+		excludeMap := make(map[string]bool)
+		for _, excludeHeader := range wsConfig.ExcludeHeaders {
+			excludeMap[strings.ToLower(excludeHeader)] = true
+		}
+
+		for key, values := range headers {
+			lowerKey := strings.ToLower(key)
+			if !excludeMap[lowerKey] && len(values) > 0 {
+				// Don't override auth headers that were already processed
+				if _, exists := forwardHeaders[key]; !exists {
+					forwardHeaders[key] = values[0]
+					w.logger.Debug(fmt.Sprintf("Forwarding header %s: %s", key, values[0]))
+				}
+			}
+		}
+	} else {
+		// Only pass specified headers
+		for _, passthroughHeader := range wsConfig.PassthroughHeaders {
+			for key, values := range headers {
+				if strings.EqualFold(key, passthroughHeader) && len(values) > 0 {
+					// Don't override auth headers that were already processed
+					if _, exists := forwardHeaders[key]; !exists {
+						forwardHeaders[key] = values[0]
+						w.logger.Debug(fmt.Sprintf("Forwarding passthrough header %s: %s", key, values[0]))
+					}
+				}
+			}
+		}
+	}
+
+	return forwardHeaders
 }
 
 // extractAuthHeaders extracts auth headers from the incoming request
