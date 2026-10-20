@@ -1,6 +1,6 @@
 module github.com/unacademy/krakend-websocket
 
-go 1.17
+go 1.24
 
 require (
 	github.com/gin-gonic/gin v1.7.7
@@ -17,7 +17,7 @@ require (
 	github.com/go-playground/validator/v10 v10.20.0 // indirect
 	github.com/golang/protobuf v1.5.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.10.3 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/kr/pretty v0.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
